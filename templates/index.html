@@ -1,0 +1,104 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Video Crime Detection</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .upload-form {
+            border: 2px dashed #ccc;
+            padding: 20px;
+            text-align: center;
+            margin-top: 30px;
+        }
+        .btn {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .message {
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        /* Alert section styles */
+        .alert-settings {
+            margin-top: 20px;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .alert-settings h3 {
+            margin-top: 0;
+        }
+        .checkbox-group {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin: 10px 0;
+        }
+        .phone-input {
+            width: 100%;
+            padding: 8px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Video Crime Detection System</h1>
+    
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="message {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+    
+    <div class="upload-form">
+        <h2>Upload Video</h2>
+        <p>Select a video file to analyze (MP4, AVI, MOV, MKV)</p>
+        <form action="{{ url_for('upload_file') }}" method="post" enctype="multipart/form-data">
+            <input type="file" name="video" accept=".mp4,.avi,.mov,.mkv">
+            
+            <!-- WhatsApp Alert Settings - Always enabled with fixed number -->
+            <div class="alert-settings">
+                <h3>WhatsApp Alert Settings</h3>
+                <p>Select which crime types should trigger alerts:</p>
+                
+                <div class="checkbox-group">
+                    {% for class_name in class_names %}
+                    <label>
+                        <input type="checkbox" name="alert_classes" value="{{ class_name }}" 
+                               {% if class_name in ["Shooting", "Robbery", "Explosion", "Assault", "Arson"] %}checked{% endif %}> 
+                        {{ class_name }}
+                    </label>
+                    {% endfor %}
+                </div>
+                
+                <p>WhatsApp alerts will be sent to: +91 7397555299</p>
+                <input type="hidden" name="phone_number" value="+917397555299">
+            </div>
+            
+            <br>
+            <button type="submit" class="btn">Upload & Analyze</button>
+        </form>
+    </div>
+</body>
+</html>
