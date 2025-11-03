@@ -88,6 +88,14 @@
     </div>
     
     <div class="result-container">
+        {% if alert_text %}
+        <h2>AI Alert Summary</h2>
+        <p style="white-space: pre-line;">{{ alert_text }}</p>
+        {% if alert_source %}
+        <p><em>AI source: {{ alert_source }}</em></p>
+        {% endif %}
+        {% endif %}
+
         <h2>Original Video</h2>
         <div class="video-container">
             <video controls>
@@ -104,6 +112,15 @@
             </video>
         </div>
         
+        {% if snapshots and snapshots|length > 0 %}
+        <h2>Detected Anomaly Snapshots</h2>
+        <div>
+            {% for img in snapshots %}
+            <img src="{{ url_for('static', filename='uploads/' + img) }}" alt="snapshot" style="max-width: 48%; margin-right: 2%; margin-bottom: 10px;"/>
+            {% endfor %}
+        </div>
+        {% endif %}
+
         <h2>Prediction Distribution</h2>
         <table>
             <tr>

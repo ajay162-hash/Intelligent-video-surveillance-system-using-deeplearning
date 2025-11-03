@@ -6,6 +6,18 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 import torch
 from werkzeug.utils import secure_filename
 from twilio.rest import Client  # Twilio import for WhatsApp integration
+from typing import Optional, List, Dict
+import base64
+import json
+import requests
+
+# Optional: Gemini (Google Generative AI) for dynamic alert descriptions
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except Exception:
+    genai = None
+    GEMINI_AVAILABLE = False
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -107,7 +119,8 @@ def predict_video(model, video_path, clip_len=16, device='cuda'):
     predictions = []
     confidences = []
     
-    for clip in tqdm(clips, desc="Processing clips"):
+    # tqdm can raise OSError on some Windows/Flask consoles; use a simple loop for web safety
+    for clip in clips:
         # Apply transformation to each frame
         processed_clip = []
         for frame in clip:
@@ -433,6 +446,14 @@ app.config['TWILIO_AUTH_TOKEN'] = os.environ.get('TWILIO_AUTH_TOKEN', '')
 app.config['TWILIO_FROM_NUMBER'] = os.environ.get('TWILIO_FROM_NUMBER', '')  
 app.config['FIXED_RECEIVER_NUMBER'] = '+919080918203'  # Fixed receiver number
 
+# Gemini configuration - optional; falls back to template text
+app.config['GOOGLE_API_KEY'] = os.environ.get('GOOGLE_API_KEY', '')
+app.config['GEMINI_MODEL'] = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash')
+
+# Optional public base URL to serve media to Twilio (must be public HTTPS)
+# Example: https://your-domain.example.com/static/uploads
+app.config['MEDIA_BASE_URL'] = os.environ.get('MEDIA_BASE_URL', '')
+
 # Check if WhatsApp/Twilio is properly configured
 WHATSAPP_ENABLED = all([
     app.config['TWILIO_ACCOUNT_SID'],
@@ -579,8 +600,189 @@ def generate_event_filename(original_filename, event_name, prefix=""):
     sanitized_event = event_name.replace(' ', '_').lower()
     return f"{prefix}{sanitized_event}_{timestamp}.{extension}"
 
+# --- Gemini helper: generate dynamic alert text ---
+def _normalize_gemini_model(name: str) -> str:
+    """Return a stable, supported Gemini model string for REST (prefer -latest)."""
+    if not name:
+        return 'gemini-2.0-flash'
+    name = name.strip()
+    # Map common aliases to stable names (prefer current GA models)
+    if name.startswith('gemini-1.5'):
+        # Migrate 1.5 aliases to a widely-available GA model
+        return 'gemini-2.0-flash'
+    if name in ('gemini-1.5-flash', 'gemini-1.5-flash-latest'):
+        return 'gemini-2.0-flash'
+    if name in ('gemini-1.5-pro', 'gemini-1.5-pro-latest'):
+        return 'gemini-2.0-flash'
+    if name in ('gemini-1.5-flash-8b', 'gemini-1.5-flash-8b-latest'):
+        return 'gemini-2.0-flash'
+    if name in ('gemini-2.0-flash', 'gemini-2.0-flash-exp'):
+        return 'gemini-2.0-flash'
+    # Default: append -latest for better availability
+    return name
+
+def generate_gemini_alert_text(event_name: str, confidence_pct: float, duration_s: float,
+                               extra_context: Optional[Dict[str, str]] = None,
+                               snapshot_filenames: Optional[List[str]] = None) -> tuple[str, str]:
+    """Generate a concise human-friendly alert using Gemini if configured; otherwise a fallback string."""
+    # Fallback text (no external dependency)
+    fallback = (
+        f"Incident: Likely {event_name} detected (confidence {confidence_pct:.1f}%).\n"
+        f"Why: Visual cues consistent with {event_name.lower()} observed in recent frames.\n"
+        "Actions:\n- Verify on live feed.\n- Alert on-site staff if risk persists.\n- Preserve footage for review."
+    )
+    if not (GEMINI_AVAILABLE and app.config['GOOGLE_API_KEY']):
+        return fallback
+    try:
+        genai.configure(api_key=app.config['GOOGLE_API_KEY'])
+        model_name = _normalize_gemini_model(app.config['GEMINI_MODEL'])
+        model = genai.GenerativeModel(model_name)
+        context_lines = []
+        if extra_context:
+            for k, v in extra_context.items():
+                context_lines.append(f"{k}: {v}")
+        ctx = "\n".join(context_lines)
+        prompt_text = (
+            "Role: on-call security operator assistant.\n"
+            "Goal: draft a professional WhatsApp alert (plain text, no markdown/emojis).\n"
+            "Style: concise, human, operational; avoid AI phrasing and hedging.\n"
+            "Format exactly:\n"
+            "[ALERT] <AnomalyType> — short scene description (what/where).\n"
+            "Why: key visual cues supporting the call.\n"
+            "Actions: two short, practical steps separated by '; '.\n"
+            "Rules: keep under 280 chars; do not list 'confidence' unless >= 60%; no personal identifiers or speculation.\n"
+            f"AnomalyType: {event_name}\n"
+            f"ConfidencePercent: {confidence_pct:.1f}\n"
+            f"ClipDurationSec: {duration_s:.1f}\n"
+            f"{ctx}\n"
+        )
+
+        # Build content parts, optionally including snapshots as images
+        content_parts = [prompt_text]
+        if snapshot_filenames:
+            # Attach up to two images as inline parts
+            for fname in snapshot_filenames[:2]:
+                img_path = os.path.join(app.config['UPLOAD_FOLDER'], fname)
+                try:
+                    with open(img_path, 'rb') as f:
+                        content_parts.append({
+                            'mime_type': 'image/jpeg',
+                            'data': f.read()
+                        })
+                except Exception:
+                    continue
+
+        try:
+            resp = model.generate_content(content_parts)
+        except Exception:
+            # Try fast fallback model
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            resp = model.generate_content(content_parts)
+        text = (resp.text or "").strip()
+        # Basic guardrails
+        if not text:
+            return fallback, 'fallback'
+        if len(text) > 400:
+            text = text[:397] + "..."
+        return text, 'gemini'
+    except Exception:
+        # REST fallback for broader compatibility on older Python
+        try:
+            api_key = app.config['GOOGLE_API_KEY']
+            model_candidates = [_normalize_gemini_model(app.config['GEMINI_MODEL'])]
+            # Single stable API version preferred by docs
+            versions = ["v1beta"]
+
+            parts = [{"text": prompt_text}]
+            if snapshot_filenames:
+                for fname in snapshot_filenames[:2]:
+                    img_path = os.path.join(app.config['UPLOAD_FOLDER'], fname)
+                    try:
+                        with open(img_path, 'rb') as f:
+                            b64 = base64.b64encode(f.read()).decode('utf-8')
+                            parts.append({
+                                "inline_data": {
+                                    "mime_type": "image/jpeg",
+                                    "data": b64
+                                }
+                            })
+                    except Exception:
+                        continue
+
+            payload = {
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "maxOutputTokens": 120,
+                    "topP": 0.9
+                }
+            }
+            headers = {"Content-Type": "application/json"}
+
+            for ver in versions:
+                for name in model_candidates:
+                    url = f"https://generativelanguage.googleapis.com/{ver}/models/{name}:generateContent?key={api_key}"
+                    try:
+                        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+                        print(f"[Gemini-REST] try {ver} {name} -> {r.status_code}")
+                        if r.status_code == 200:
+                            data = r.json()
+                            text = ""
+                            try:
+                                cands = data.get("candidates", [])
+                                if cands:
+                                    parts_out = cands[0].get("content", {}).get("parts", [])
+                                    txts = [p.get("text", "") for p in parts_out if "text" in p]
+                                    text = "\n".join(t for t in txts if t).strip()
+                            except Exception:
+                                text = ""
+                            if text:
+                                if len(text) > 400:
+                                    text = text[:397] + "..."
+                                return text, 'gemini-rest'
+                    except Exception:
+                        continue
+            return fallback, 'fallback'
+        except Exception:
+            return fallback, 'fallback'
+
+# --- Video helper: save 1-2 anomaly frames near peak-confidence clip ---
+def save_anomaly_frames(video_path: str, best_clip_idx: int, event_name: str,
+                        clip_len: int = 16, sample_rate: int = 10, overlap: float = 0.5,
+                        count: int = 2) -> List[str]:
+    """Extract representative frames near the peak-confidence clip and save into uploads. Returns filenames."""
+    try:
+        import cv2
+        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+        # Map clip index to approximate source frame index
+        step = max(1, int(clip_len * (1 - overlap)))
+        sampled_start = best_clip_idx * step
+        # Choose center and an offset frame within the clip window
+        sampled_centers = [sampled_start + clip_len // 2]
+        if count > 1:
+            sampled_centers.append(sampled_start + min(clip_len - 1, (3 * clip_len) // 4))
+        # Convert sampled indices to original frame numbers
+        frame_indices = [max(0, idx * sample_rate) for idx in sampled_centers]
+        cap = cv2.VideoCapture(video_path)
+        saved_files = []
+        for i, frame_idx in enumerate(frame_indices[:count]):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            fname = generate_event_filename("frame.jpg", event_name, prefix=f"snapshot{i+1}_")
+            out_path = os.path.join(app.config['UPLOAD_FOLDER'], fname)
+            cv2.imwrite(out_path, frame)
+            saved_files.append(fname)
+        cap.release()
+        return saved_files
+    except Exception:
+        return []
+
 # Function to send WhatsApp alert with Twilio
-def send_whatsapp_alert(to_number, event_name, confidence, location="Unknown Location"):
+def send_whatsapp_alert(to_number, event_name, confidence, location="Unknown Location", *,
+                        message_override: Optional[str] = None,
+                        media_filenames: Optional[List[str]] = None):
     # Check if WhatsApp/Twilio is properly configured
     if not WHATSAPP_ENABLED:
         print("WhatsApp alerts are not configured. Set TWILIO environment variables to enable.")
@@ -611,18 +813,41 @@ def send_whatsapp_alert(to_number, event_name, confidence, location="Unknown Loc
         # Initialize Twilio client with your credentials
         client = Client(app.config['TWILIO_ACCOUNT_SID'], app.config['TWILIO_AUTH_TOKEN'])
         
-        # Format the message
-        message_body = f"⚠️ ALERT: {event_name} detected with {confidence:.2f}% confidence.\n"
-        message_body += f"Location: {location}\n"
-        message_body += f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        message_body += "Please check the surveillance system immediately."
-        
-        # Send the WhatsApp message
-        message = client.messages.create(
-            body=message_body,
-            from_=from_number,
-            to=whatsapp_to
-        )
+        # Build message body (Gemini override if provided)
+        if message_override:
+            message_body = message_override
+        else:
+            message_body = f"⚠️ ALERT: {event_name} detected with {confidence:.1f}% confidence.\n"
+            message_body += f"Location: {location}\n"
+            message_body += f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            message_body += "Please check the surveillance system immediately."
+
+        # Optional media (requires MEDIA_BASE_URL to be a public HTTPS host)
+        media_urls = None
+        base = app.config['MEDIA_BASE_URL'].strip()
+        if base and media_filenames:
+            # Ensure no trailing slash
+            if base.endswith('/'):
+                base = base[:-1]
+            try:
+                media_urls = [f"{base}/{fname}" for fname in media_filenames]
+            except Exception:
+                media_urls = None
+
+        # Send the WhatsApp message (with or without media)
+        if media_urls:
+            message = client.messages.create(
+                body=message_body,
+                from_=from_number,
+                to=whatsapp_to,
+                media_url=media_urls
+            )
+        else:
+            message = client.messages.create(
+                body=message_body,
+                from_=from_number,
+                to=whatsapp_to
+            )
         
         print(f"WhatsApp alert sent to {whatsapp_to}: {message.sid}")
         return True, message.sid
@@ -771,6 +996,41 @@ def process_video(filename):
                 with open(vis_filepath_web, 'rb') as src_file, open(vis_filepath_output, 'wb') as dst_file:
                     dst_file.write(src_file.read())
             
+            # Prepare Gemini alert text and anomaly snapshots
+            # Determine best clip index for snapshots
+            best_clip_idx = None
+            try:
+                if all_preds and all_confs:
+                    best = -1.0
+                    idx = None
+                    for i, (p, c) in enumerate(zip(all_preds, all_confs)):
+                        if p == pred_class and c > best:
+                            best = c
+                            idx = i
+                    best_clip_idx = idx
+            except Exception:
+                best_clip_idx = None
+
+            # Save 1-2 representative frames
+            snapshot_files = []
+            if best_clip_idx is not None:
+                snapshot_files = save_anomaly_frames(
+                    filepath, best_clip_idx, event_name,
+                    clip_len=16, sample_rate=10, overlap=0.5, count=2
+                )
+
+            # Generate dynamic alert text (Gemini if available)
+            alert_text, alert_source = generate_gemini_alert_text(
+                event_name=event_name,
+                confidence_pct=confidence * 100.0,
+                duration_s=processing_time,
+                extra_context={
+                    "TopPrediction": event_name,
+                    "Confidence": f"{confidence*100:.1f}%",
+                },
+                snapshot_filenames=snapshot_files
+            )
+
             # Send WhatsApp alert if class is in alert list
             alert_sent = False
             alert_message = "The detected event is not in your alert list."
@@ -779,7 +1039,9 @@ def process_video(filename):
                 success, message_id = send_whatsapp_alert(
                     phone_number,
                     event_name,
-                    confidence * 100
+                    confidence * 100,
+                    message_override=alert_text,
+                    media_filenames=snapshot_files
                 )
                 alert_sent = success
                 if not success:
@@ -796,7 +1058,10 @@ def process_video(filename):
                 class_counts=class_counts,
                 alert_sent=alert_sent,
                 alert_message=alert_message,
-                phone_number=phone_number
+                phone_number=phone_number,
+                alert_text=alert_text,
+                alert_source=alert_source,
+                snapshots=snapshot_files
             )
         else:
             flash('Could not process video. Please try another one.', 'error')
