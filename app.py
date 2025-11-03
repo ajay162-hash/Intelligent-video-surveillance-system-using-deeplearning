@@ -6,6 +6,8 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 import torch
 from werkzeug.utils import secure_filename
 from twilio.rest import Client  # Twilio import for WhatsApp integration
+from dotenv import load_dotenv
+load_dotenv()
 
 # Add parent directory to path to import from project
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -429,7 +431,7 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max upload size
 app.config['TWILIO_ACCOUNT_SID'] = os.environ.get('TWILIO_ACCOUNT_SID', '')
 app.config['TWILIO_AUTH_TOKEN'] = os.environ.get('TWILIO_AUTH_TOKEN', '')
 app.config['TWILIO_FROM_NUMBER'] = os.environ.get('TWILIO_FROM_NUMBER', '')  
-app.config['FIXED_RECEIVER_NUMBER'] = '+917397555299'  # Fixed receiver number
+app.config['FIXED_RECEIVER_NUMBER'] = '+919080918203'  # Fixed receiver number
 
 # Check if WhatsApp/Twilio is properly configured
 WHATSAPP_ENABLED = all([
@@ -586,8 +588,26 @@ def send_whatsapp_alert(to_number, event_name, confidence, location="Unknown Loc
     
     try:
         # Always use the fixed number regardless of input
-        to_number = app.config['FIXED_RECEIVER_NUMBER'].strip('+')
-        
+        to_number = app.config['FIXED_RECEIVER_NUMBER']
+
+        # Normalize Twilio numbers for WhatsApp
+        from_number = app.config['TWILIO_FROM_NUMBER'].strip()
+        if not from_number:
+            return False, "TWILIO_FROM_NUMBER is empty"
+        # Ensure from_number has whatsapp: prefix
+        if not from_number.startswith('whatsapp:'):
+            # Accept numbers with or without leading +
+            if from_number.startswith('+'):
+                from_number = f"whatsapp:{from_number}"
+            else:
+                from_number = f"whatsapp:+{from_number}"
+
+        # Ensure to_number starts with whatsapp:+<countrycode><number>
+        normalized_to = to_number.strip()
+        if not normalized_to.startswith('+'):
+            normalized_to = f"+{normalized_to}"
+        whatsapp_to = f"whatsapp:{normalized_to}"
+
         # Initialize Twilio client with your credentials
         client = Client(app.config['TWILIO_ACCOUNT_SID'], app.config['TWILIO_AUTH_TOKEN'])
         
@@ -600,11 +620,11 @@ def send_whatsapp_alert(to_number, event_name, confidence, location="Unknown Loc
         # Send the WhatsApp message
         message = client.messages.create(
             body=message_body,
-            from_=app.config['TWILIO_FROM_NUMBER'],
-            to=f"whatsapp:+{to_number}"
+            from_=from_number,
+            to=whatsapp_to
         )
         
-        print(f"WhatsApp alert sent to +{to_number}: {message.sid}")
+        print(f"WhatsApp alert sent to {whatsapp_to}: {message.sid}")
         return True, message.sid
     except Exception as e:
         print(f"Failed to send WhatsApp alert: {str(e)}")

@@ -19,10 +19,9 @@ import gzip
 # UCF Crime Dataset URLs (using alternative download sources)
 DATASET_URLS = [
     # Primary source (if available)
-    "http://crcv.ucf.edu/projects/real-world/Anomaly_Detection_in_Video_files.tar.gz",
+     #"http://crcv.ucf.edu/projects/real-world/Anomaly_Detection_in_Video_files.tar.gz",
     # Alternative sources - these are placeholders, you'll need to update with actual URLs
-    # "https://www.dropbox.com/s/example/ucf_crime_dataset.zip",
-    # "https://drive.google.com/file/d/example/view?usp=sharing",
+    #"https://www.kaggle.com/datasets/odins0n/ucf-crime-dataset",
 ]
 
 # Class names and their expected folders

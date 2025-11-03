@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# Spatial-Temporal Attention Module (from train.py)
 class SpatialTemporalAttention(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super(SpatialTemporalAttention, self).__init__()
