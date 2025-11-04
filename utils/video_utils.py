@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import os
-from tqdm import tqdm
 
 def extract_frames_from_video(video_path, sample_rate=10):
     """
@@ -27,11 +26,14 @@ def extract_frames_from_video(video_path, sample_rate=10):
     # Get video properties
     frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = video.get(cv2.CAP_PROP_FPS)
+    # Some files report 0 FPS; default to 25 for browser compatibility
+    if not fps or fps <= 1e-3:
+        fps = 25.0
     
     print(f"Video info: {frame_count} frames, {fps} FPS")
     
     # Extract frames
-    for i in tqdm(range(frame_count), desc="Extracting frames"):
+    for i in range(frame_count):
         # Set the frame position
         video.set(cv2.CAP_PROP_POS_FRAMES, i)
         
@@ -114,36 +116,51 @@ def save_prediction_visualization(video_path, predictions, confidences, class_na
     width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # Create VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    # Create VideoWriter object with better browser compatibility
+    # Try H.264 tag first ('avc1'), then fallback to 'mp4v'
+    def _open_writer(path, fps, size):
+        try:
+            fourcc_try = cv2.VideoWriter_fourcc(*'avc1')
+            vw = cv2.VideoWriter(path, fourcc_try, fps, size)
+            if vw is not None and vw.isOpened():
+                return vw
+        except Exception:
+            pass
+        fourcc_fallback = cv2.VideoWriter_fourcc(*'mp4v')
+        return cv2.VideoWriter(path, fourcc_fallback, fps, size)
+
+    out = _open_writer(output_path, fps, (width, height))
+    if out is None or not out.isOpened():
+        # As a last resort, try writing to a .avi container with MJPG
+        alt_path = os.path.splitext(output_path)[0] + '.avi'
+        fourcc_alt = cv2.VideoWriter_fourcc(*'MJPG')
+        out = cv2.VideoWriter(alt_path, fourcc_alt, fps, (width, height))
+        output_path = alt_path
     
     # Calculate frames per clip
     frames_per_clip = frame_count / len(predictions)
     
     # Process each frame
     frame_idx = 0
-    with tqdm(total=frame_count, desc="Creating visualization") as pbar:
-        while True:
-            ret, frame = video.read()
-            if not ret:
-                break
-            
-            # Calculate which clip this frame belongs to
-            clip_idx = min(int(frame_idx / frames_per_clip), len(predictions) - 1)
-            pred_class = predictions[clip_idx]
-            confidence = confidences[clip_idx]
-            
-            # Add prediction text to frame
-            text = f"{class_names[pred_class]}: {confidence:.2f}"
-            cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                        1, (0, 0, 255), 2, cv2.LINE_AA)
-            
-            # Write the frame
-            out.write(frame)
-            
-            frame_idx += 1
-            pbar.update(1)
+    while True:
+        ret, frame = video.read()
+        if not ret:
+            break
+        
+        # Calculate which clip this frame belongs to
+        clip_idx = min(int(frame_idx / frames_per_clip), len(predictions) - 1)
+        pred_class = predictions[clip_idx]
+        confidence = confidences[clip_idx]
+        
+        # Add prediction text to frame
+        text = f"{class_names[pred_class]}: {confidence:.2f}"
+        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                    1, (0, 0, 255), 2, cv2.LINE_AA)
+        
+        # Write the frame
+        out.write(frame)
+        
+        frame_idx += 1
     
     # Release everything
     video.release()

@@ -991,9 +991,10 @@ def process_video(filename):
                 output_path=vis_filepath_web
             )
             
-            # Also save a copy to the output folder
-            if os.path.exists(vis_filepath_web):
-                with open(vis_filepath_web, 'rb') as src_file, open(vis_filepath_output, 'wb') as dst_file:
+            # Also save a copy to the output folder (use actual path returned in case extension changed)
+            actual_vis_web = vis_path if vis_path else vis_filepath_web
+            if os.path.exists(actual_vis_web):
+                with open(actual_vis_web, 'rb') as src_file, open(vis_filepath_output, 'wb') as dst_file:
                     dst_file.write(src_file.read())
             
             # Prepare Gemini alert text and anomaly snapshots
