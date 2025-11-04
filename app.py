@@ -10,6 +10,7 @@ from typing import Optional, List, Dict
 import base64
 import json
 import requests
+import mimetypes
 
 # Optional: Gemini (Google Generative AI) for dynamic alert descriptions
 try:
@@ -20,6 +21,13 @@ except Exception:
     GEMINI_AVAILABLE = False
 from dotenv import load_dotenv
 load_dotenv()
+try:
+    # Also load optional supabase-specific overrides if present
+    _alt_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.supabase")
+    if os.path.exists(_alt_env):
+        load_dotenv(_alt_env, override=True)
+except Exception:
+    pass
 
 # Add parent directory to path to import from project
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -50,7 +58,7 @@ MODEL_AVAILABLE = MAXACCURACY_MODEL_AVAILABLE or C3D_AVAILABLE
 
 # Import utils directly from local directory
 sys.path.insert(0, os.path.join(current_dir, 'utils'))
-from video_utils import save_prediction_visualization
+from video_utils import save_prediction_visualization, export_anomaly_clip
 
 # Now import inference
 sys.path.insert(0, current_dir)
@@ -454,6 +462,23 @@ app.config['GEMINI_MODEL'] = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash')
 # Example: https://your-domain.example.com/static/uploads
 app.config['MEDIA_BASE_URL'] = os.environ.get('MEDIA_BASE_URL', '')
 
+# Supabase configuration (optional, enables permanent public URLs without a domain)
+app.config['SUPABASE_URL'] = os.environ.get('SUPABASE_URL', '')
+app.config['SUPABASE_SERVICE_KEY'] = os.environ.get('SUPABASE_SERVICE_KEY', '')
+app.config['SUPABASE_BUCKET'] = os.environ.get('SUPABASE_BUCKET', 'media')
+try:
+    from supabase import create_client as _create_supabase_client  # type: ignore
+    SUPABASE_AVAILABLE = True
+except Exception:
+    _create_supabase_client = None
+    SUPABASE_AVAILABLE = False
+
+# If env was not provided, fall back to user-provided values (local default)
+if not app.config['SUPABASE_URL']:
+    app.config['SUPABASE_URL'] = 'https://joronooxhbccffvbshry.supabase.co'
+if not app.config['SUPABASE_SERVICE_KEY']:
+    app.config['SUPABASE_SERVICE_KEY'] = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impvcm9ub294aGJjY2ZmdmJzaHJ5Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1OTAyMzUzMywiZXhwIjoyMDc0NTk5NTMzfQ.TFzGHntsg4Uj9FLJDRhmUUGAkcQ9bWpL_ZAmBemy5XQ'
+
 # Check if WhatsApp/Twilio is properly configured
 WHATSAPP_ENABLED = all([
     app.config['TWILIO_ACCOUNT_SID'],
@@ -599,6 +624,127 @@ def generate_event_filename(original_filename, event_name, prefix=""):
     extension = original_filename.rsplit('.', 1)[1].lower()
     sanitized_event = event_name.replace(' ', '_').lower()
     return f"{prefix}{sanitized_event}_{timestamp}.{extension}"
+
+# --- Supabase helpers ---
+def get_supabase_client():
+    if not (SUPABASE_AVAILABLE and app.config['SUPABASE_URL'] and app.config['SUPABASE_SERVICE_KEY']):
+        return None
+    try:
+        return _create_supabase_client(app.config['SUPABASE_URL'], app.config['SUPABASE_SERVICE_KEY'])
+    except Exception:
+        return None
+
+def upload_media_to_supabase(local_path: str, dest_name: str) -> str:
+    """Upload a local file to Supabase public bucket using REST API to ensure correct content-type.
+    Returns public URL or empty string on failure."""
+    client = get_supabase_client()
+    if client is None:
+        print("[Supabase] Client not available")
+        return ''
+    bucket = app.config['SUPABASE_BUCKET'] or 'media'
+    supabase_url = app.config['SUPABASE_URL']
+    service_key = app.config['SUPABASE_SERVICE_KEY']
+    
+    # Determine content type with explicit overrides
+    ext = os.path.splitext(dest_name)[1].lower()
+    if ext in {'.mp4', '.m4v'}:
+        content_type = 'video/mp4'
+    elif ext in {'.jpg', '.jpeg'}:
+        content_type = 'image/jpeg'
+    elif ext in {'.png'}:
+        content_type = 'image/png'
+    else:
+        content_type, _ = mimetypes.guess_type(dest_name)
+        if not content_type:
+            content_type = 'application/octet-stream'
+    
+    # Use a date-based path for uniqueness
+    subdir = time.strftime('%Y/%m/%d')
+    object_path = f"{subdir}/{dest_name}"
+    
+    try:
+        # Use REST API directly to ensure content-type header is set correctly
+        upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{object_path}"
+        headers = {
+            'Authorization': f'Bearer {service_key}',
+            'Content-Type': content_type,
+            'x-upsert': 'true'
+        }
+        
+        with open(local_path, 'rb') as f:
+            file_data = f.read()
+        
+        print(f"[Supabase] Uploading {dest_name} ({len(file_data)} bytes) as {content_type}")
+        response = requests.put(upload_url, headers=headers, data=file_data, timeout=30)
+        
+        if response.status_code not in (200, 201):
+            print(f"[Supabase] Upload failed: {response.status_code} - {response.text[:200]}")
+            return ''
+        
+        # Get public URL
+        public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{object_path}"
+        
+        # Verify the content-type is correct
+        try:
+            verify_resp = requests.head(public_url, timeout=10)
+            if verify_resp.status_code == 405:
+                verify_resp = requests.get(public_url, stream=True, timeout=10)
+            actual_ctype = verify_resp.headers.get('Content-Type', '')
+            print(f"[Supabase] Uploaded {dest_name}, public URL content-type: {actual_ctype}")
+            if not (actual_ctype.startswith('image/') or actual_ctype.startswith('video/')):
+                print(f"[Supabase] WARNING: Content-type mismatch! Expected media type, got {actual_ctype}")
+        except Exception as e:
+            print(f"[Supabase] Could not verify content-type: {e}")
+        
+        return public_url
+    except Exception as e:
+        print(f"[Supabase] Upload error: {e}")
+        import traceback
+        traceback.print_exc()
+        return ''
+
+def build_public_urls_for_media(local_filenames: List[str]) -> List[str]:
+    """Turn local filenames in static/uploads into internet-reachable URLs.
+    Prefers Supabase if configured; falls back to MEDIA_BASE_URL.
+    """
+    public_urls: List[str] = []
+    uploads_dir = app.config['UPLOAD_FOLDER']
+    # Prefer Supabase
+    if get_supabase_client() is not None:
+        for name in local_filenames:
+            local_path = os.path.join(uploads_dir, name)
+            url = upload_media_to_supabase(local_path, name)
+            if url:
+                public_urls.append(url)
+    # Fallback to MEDIA_BASE_URL
+    if not public_urls and app.config['MEDIA_BASE_URL']:
+        base = app.config['MEDIA_BASE_URL'].rstrip('/')
+        for name in local_filenames:
+            public_urls.append(f"{base}/{name}")
+    return public_urls
+
+def validate_media_urls(urls: List[str]) -> List[str]:
+    """Filter URLs to those that are publicly reachable with a valid media content-type."""
+    valid: List[str] = []
+    for u in urls:
+        try:
+            print(f"[Validation] Checking {u}")
+            r = requests.head(u, timeout=10, allow_redirects=True)
+            if r.status_code == 405:  # some CDNs disallow HEAD
+                r = requests.get(u, stream=True, timeout=10, allow_redirects=True)
+            ctype = r.headers.get('Content-Type', '')
+            print(f"[Validation] Status: {r.status_code}, Content-Type: {ctype}")
+            if r.status_code == 200 and (
+                ctype.startswith('image/') or ctype.startswith('video/')
+            ):
+                print(f"[Validation] ✓ Valid media URL: {u}")
+                valid.append(u)
+            else:
+                print(f"[Validation] ✗ Invalid: status={r.status_code}, type={ctype}")
+        except Exception as e:
+            print(f"[Validation] ✗ Error checking {u}: {e}")
+            continue
+    return valid
 
 # --- Gemini helper: generate dynamic alert text ---
 def _normalize_gemini_model(name: str) -> str:
@@ -782,7 +928,8 @@ def save_anomaly_frames(video_path: str, best_clip_idx: int, event_name: str,
 # Function to send WhatsApp alert with Twilio
 def send_whatsapp_alert(to_number, event_name, confidence, location="Unknown Location", *,
                         message_override: Optional[str] = None,
-                        media_filenames: Optional[List[str]] = None):
+                        media_filenames: Optional[List[str]] = None,
+                        media_urls: Optional[List[str]] = None):
     # Check if WhatsApp/Twilio is properly configured
     if not WHATSAPP_ENABLED:
         print("WhatsApp alerts are not configured. Set TWILIO environment variables to enable.")
@@ -815,34 +962,91 @@ def send_whatsapp_alert(to_number, event_name, confidence, location="Unknown Loc
         
         # Build message body (Gemini override if provided)
         if message_override:
-            message_body = message_override
+            message_body = message_override.strip()
+            print(f"[WhatsApp] Using AI-generated (Gemini) alert message: {message_body[:80]}...")
         else:
             message_body = f"⚠️ ALERT: {event_name} detected with {confidence:.1f}% confidence.\n"
             message_body += f"Location: {location}\n"
             message_body += f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             message_body += "Please check the surveillance system immediately."
+            print(f"[WhatsApp] Using default (non-AI) alert message")
+        
+        # When media is attached, ensure message is concise (Twilio WhatsApp limit ~1600 chars with media)
+        # Keep essential info but truncate if too long
+        if media_urls or media_filenames:
+            if len(message_body) > 1200:
+                # Keep first part and truncate
+                message_body = message_body[:1200].rsplit('\n', 1)[0] + "\n[View attached media for details]"
 
         # Optional media (requires MEDIA_BASE_URL to be a public HTTPS host)
-        media_urls = None
-        base = app.config['MEDIA_BASE_URL'].strip()
-        if base and media_filenames:
-            # Ensure no trailing slash
-            if base.endswith('/'):
-                base = base[:-1]
+        # Determine media URLs
+        if media_urls is None and media_filenames:
             try:
-                media_urls = [f"{base}/{fname}" for fname in media_filenames]
-            except Exception:
+                media_urls = build_public_urls_for_media(media_filenames)
+                print(f"[WhatsApp] Built {len(media_urls)} media URLs from {len(media_filenames)} files")
+            except Exception as e:
+                print(f"[WhatsApp] Failed to build media URLs: {e}")
                 media_urls = None
 
-        # Send the WhatsApp message (with or without media)
+        # Validate and send media
+        valid_media = []
         if media_urls:
-            message = client.messages.create(
-                body=message_body,
-                from_=from_number,
-                to=whatsapp_to,
-                media_url=media_urls
-            )
+            valid_media = validate_media_urls(media_urls)
+            print(f"[WhatsApp] Validated {len(valid_media)}/{len(media_urls)} media URLs")
+            if valid_media:
+                print(f"[WhatsApp] Sending media: {valid_media[0]}")
+            else:
+                print(f"[WhatsApp] WARNING: No valid media URLs! All {len(media_urls)} URLs failed validation")
+
+        # Ensure message body is not empty (required by Twilio even with media)
+        if not message_body or not message_body.strip():
+            message_body = f"⚠️ ALERT: {event_name} detected with {confidence:.1f}% confidence."
+        
+        # Log what we're about to send
+        print(f"[WhatsApp] Message body preview: {message_body[:100]}...")
+        print(f"[WhatsApp] Message body full length: {len(message_body)} chars")
+
+        # Send the WhatsApp message (with or without media)
+        if valid_media:
+            # Twilio WhatsApp sometimes drops body when media_url is included
+            # Solution: Send text message first, then media with caption
+            media_url_list = valid_media[:1] if isinstance(valid_media, list) else [valid_media[0]]
+            
+            # Step 1: Send the full AI-generated alert text first
+            print(f"[WhatsApp] Step 1: Sending text message first. Body: '{message_body[:50]}...'")
+            try:
+                text_message = client.messages.create(
+                    body=message_body,
+                    from_=from_number,
+                    to=whatsapp_to
+                )
+                print(f"[WhatsApp] Text message sent. SID: {text_message.sid}")
+            except Exception as e:
+                print(f"[WhatsApp] ERROR sending text message: {e}")
+                text_message = None
+            
+            # Step 2: Send media with a short caption (optional, but helps if first message fails)
+            print(f"[WhatsApp] Step 2: Sending media with caption. Media: {media_url_list[0]}")
+            try:
+                # Short caption summarizing the alert
+                media_caption = f"📹 {event_name} detected ({confidence:.1f}% confidence)"
+                message = client.messages.create(
+                    body=media_caption,  # Short caption for media
+                    from_=from_number,
+                    to=whatsapp_to,
+                    media_url=media_url_list
+                )
+                print(f"[WhatsApp] Media message sent. SID: {message.sid}")
+                # Return the text message SID as primary (contains the full AI message)
+                message = text_message if text_message else message
+            except Exception as e:
+                print(f"[WhatsApp] ERROR sending media: {e}")
+                # If media fails, we at least sent the text
+                message = text_message if text_message else None
+                if not message:
+                    raise Exception("Failed to send both text and media")
         else:
+            print(f"[WhatsApp] Sending message WITHOUT media. Body: '{message_body[:50]}...'")
             message = client.messages.create(
                 body=message_body,
                 from_=from_number,
@@ -1020,6 +1224,23 @@ def process_video(filename):
                     clip_len=16, sample_rate=10, overlap=0.5, count=2
                 )
 
+            # Try to export a short anomaly clip (3s) for WhatsApp media
+            clip_file = ''
+            try:
+                # Map best_clip_idx to approximate center frame index in original video
+                step = max(1, int(16 * (1 - 0.5)))  # consistent with predict_video
+                sampled_center = (best_clip_idx if best_clip_idx is not None else 0) * step + 8
+                center_frame = sampled_center * 10  # sample_rate=10 in predict_video
+                clip_file = export_anomaly_clip(
+                    filepath,
+                    center_frame=center_frame,
+                    seconds=3.0,
+                    out_dir=app.config['UPLOAD_FOLDER'],
+                    prefix=f"clip_{event_name.lower()}_"
+                )
+            except Exception:
+                clip_file = ''
+
             # Generate dynamic alert text (Gemini if available)
             alert_text, alert_source = generate_gemini_alert_text(
                 event_name=event_name,
@@ -1037,12 +1258,22 @@ def process_video(filename):
             alert_message = "The detected event is not in your alert list."
             
             if event_name in alert_classes:
+                media_list = []
+                if clip_file:
+                    media_list.append(clip_file)
+                elif snapshot_files:
+                    media_list.extend(snapshot_files)
+
+                # Turn local filenames into public URLs (Supabase preferred)
+                public_urls = build_public_urls_for_media(media_list) if media_list else None
+
                 success, message_id = send_whatsapp_alert(
                     phone_number,
                     event_name,
                     confidence * 100,
                     message_override=alert_text,
-                    media_filenames=snapshot_files
+                    media_filenames=media_list,
+                    media_urls=public_urls
                 )
                 alert_sent = success
                 if not success:

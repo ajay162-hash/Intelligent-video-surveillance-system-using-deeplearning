@@ -168,3 +168,60 @@ def save_prediction_visualization(video_path, predictions, confidences, class_na
     
     print(f"Visualization saved to {output_path}")
     return output_path
+
+
+def export_anomaly_clip(video_path: str, center_frame: int, seconds: float = 3.0, out_dir: str = None,
+                        prefix: str = "clip_", fallback_fps: float = 25.0) -> str:
+    """Export a short MP4 clip around a center frame. Returns output filename (basename) if saved, else ''.
+    The clip is written to out_dir (or same folder as video) and uses H.264 if available, else mp4v.
+    """
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return ''
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 1e-3:
+            fps = fallback_fps
+        half = int(max(1, seconds * fps / 2))
+        start = max(0, center_frame - half)
+        end = min(total_frames - 1, center_frame + half)
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        base_dir = out_dir if out_dir else os.path.dirname(video_path)
+        os.makedirs(base_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        out_name = f"{prefix}{base_name}.mp4"
+        out_path = os.path.join(base_dir, out_name)
+
+        def _open_writer(path):
+            try:
+                f1 = cv2.VideoWriter_fourcc(*'avc1')
+                vw = cv2.VideoWriter(path, f1, fps, (width, height))
+                if vw is not None and vw.isOpened():
+                    return vw
+            except Exception:
+                pass
+            f2 = cv2.VideoWriter_fourcc(*'mp4v')
+            return cv2.VideoWriter(path, f2, fps, (width, height))
+
+        writer = _open_writer(out_path)
+        if writer is None or not writer.isOpened():
+            return ''
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        cur = start
+        while cur <= end:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(frame)
+            cur += 1
+
+        cap.release()
+        writer.release()
+        return out_name
+    except Exception:
+        return ''

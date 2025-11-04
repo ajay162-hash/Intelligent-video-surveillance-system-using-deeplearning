@@ -82,10 +82,16 @@
                 <h3>WhatsApp Alert Settings</h3>
                 <p>Select which crime types should trigger alerts:</p>
                 
+                <!-- Select All checkbox -->
+                <label style="display: block; margin-bottom: 10px; font-weight: bold; padding: 8px; background-color: #f0f0f0; border-radius: 4px;">
+                    <input type="checkbox" id="selectAll" checked>
+                    <strong>Select All</strong>
+                </label>
+                
                 <div class="checkbox-group">
                     {% for class_name in class_names %}
                     <label>
-                        <input type="checkbox" name="alert_classes" value="{{ class_name }}" 
+                        <input type="checkbox" name="alert_classes" value="{{ class_name }}" class="alert-checkbox"
                                {% if class_name in ["Shooting", "Robbery", "Explosion", "Assault", "Arson"] %}checked{% endif %}> 
                         {{ class_name }}
                     </label>
@@ -100,5 +106,34 @@
             <button type="submit" class="btn">Upload & Analyze</button>
         </form>
     </div>
+    
+    <script>
+        // Select All functionality
+        const selectAllCheckbox = document.getElementById('selectAll');
+        const alertCheckboxes = document.querySelectorAll('.alert-checkbox');
+        
+        // Update Select All state based on individual checkboxes
+        function updateSelectAllState() {
+            const allChecked = Array.from(alertCheckboxes).every(cb => cb.checked);
+            const someChecked = Array.from(alertCheckboxes).some(cb => cb.checked);
+            selectAllCheckbox.checked = allChecked;
+            selectAllCheckbox.indeterminate = someChecked && !allChecked;
+        }
+        
+        // When Select All is clicked, toggle all checkboxes
+        selectAllCheckbox.addEventListener('change', function() {
+            alertCheckboxes.forEach(checkbox => {
+                checkbox.checked = selectAllCheckbox.checked;
+            });
+        });
+        
+        // When individual checkboxes change, update Select All state
+        alertCheckboxes.forEach(checkbox => {
+            checkbox.addEventListener('change', updateSelectAllState);
+        });
+        
+        // Initialize Select All state on page load
+        updateSelectAllState();
+    </script>
 </body>
 </html>
