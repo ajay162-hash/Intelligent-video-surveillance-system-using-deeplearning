@@ -1,0 +1,15 @@
+# Large file tracking via Git LFS
+# Install once on your machine: `git lfs install`
+# Then these files will be stored using LFS pointers in Git.
+
+# Track the shipped best-model checkpoints
+trained_models_v2/*.pth filter=lfs diff=lfs merge=lfs -text
+trained_models/*.pth     filter=lfs diff=lfs merge=lfs -text
+
+# Normalize line endings: keep LF in repo and working tree by default
+* text=auto eol=lf
+# Windows-friendly exceptions
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.sh  text eol=lf

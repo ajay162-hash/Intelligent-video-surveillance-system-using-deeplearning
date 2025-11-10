@@ -28,6 +28,10 @@ MANIFEST
 *.pt
 *.ckpt
 
+# Allow shipping pre-trained best checkpoints
+!trained_models/best_model.pth
+!trained_models_v2/best_model.pth
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
@@ -77,7 +81,10 @@ outputs/*
 !outputs/.gitkeep
 static/uploads/*
 !static/uploads/.gitkeep
-trained_models/*.pth
+trained_models_final/*.pth
+trained_models_labelsmooth/*.pth
+trained_models_max_accuracy/*.pth
+trained_models_stable/*.pth
 
 # Logs
 *.log
@@ -88,3 +95,6 @@ tensorboard_logs/
 tmp/
 temp/
 *.tmp
+
+# Docs (do not publish)
+wrap.md

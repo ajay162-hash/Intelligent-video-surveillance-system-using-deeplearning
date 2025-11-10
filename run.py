@@ -32,18 +32,27 @@ def check_dependencies():
     return True
 
 def check_model():
-    """Check if trained model exists"""
-    model_path = "trained_models/best_model.pth"
-    if os.path.exists(model_path):
-        print("✅ Pre-trained model found")
+    """Check if a pre-trained model exists (prefer v2)."""
+    candidates = [
+        "trained_models_v2/best_model.pth",
+        "trained_models/best_model.pth",
+    ]
+    found = None
+    for p in candidates:
+        if os.path.exists(p):
+            found = p
+            break
+    if found:
+        print(f"✅ Pre-trained model found: {found}")
         return True
-    else:
-        print("❌ No pre-trained model found")
-        print(f"   Expected location: {model_path}")
-        print("\n🔧 Options:")
-        print("1. Copy your trained model to trained_models/best_model.pth")
-        print("2. Train a new model using: python train.py --help")
-        return False
+    print("❌ No pre-trained model found")
+    print("   Looked for:")
+    for p in candidates:
+        print(f"   - {p}")
+    print("\n🔧 Options:")
+    print("1. Place your checkpoint at one of the above paths")
+    print("2. Train a new model using: python train.py --help")
+    return False
 
 def main():
     print("🎥 Intelligent Video Surveillance System")

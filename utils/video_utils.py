@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import os
+from typing import Optional
 
 def extract_frames_from_video(video_path, sample_rate=10):
     """
@@ -138,7 +139,7 @@ def save_prediction_visualization(video_path, predictions, confidences, class_na
         output_path = alt_path
     
     # Calculate frames per clip
-    frames_per_clip = frame_count / len(predictions)
+    frames_per_clip = frame_count / max(1, len(predictions))
     
     # Process each frame
     frame_idx = 0
@@ -148,9 +149,9 @@ def save_prediction_visualization(video_path, predictions, confidences, class_na
             break
         
         # Calculate which clip this frame belongs to
-        clip_idx = min(int(frame_idx / frames_per_clip), len(predictions) - 1)
-        pred_class = predictions[clip_idx]
-        confidence = confidences[clip_idx]
+        clip_idx = min(int(frame_idx / frames_per_clip), max(0, len(predictions) - 1))
+        pred_class = predictions[clip_idx] if predictions else 0
+        confidence = confidences[clip_idx] if confidences else 0.0
         
         # Add prediction text to frame
         text = f"{class_names[pred_class]}: {confidence:.2f}"
@@ -225,3 +226,62 @@ def export_anomaly_clip(video_path: str, center_frame: int, seconds: float = 3.0
         return out_name
     except Exception:
         return ''
+
+
+def save_prediction_visualization_segment(video_path, predictions, confidences, class_names,
+                                          center_frame: int, seconds: float = 6.0, output_path: Optional[str] = None):
+    """Create a short visualization clip centered at center_frame with prediction overlay.
+    Returns the output path or None on failure.
+    """
+    try:
+        if output_path is None:
+            base_name = os.path.splitext(os.path.basename(video_path))[0]
+            output_path = f"{base_name}_prediction_segment.mp4"
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 1e-3:
+            fps = 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Writer (H.264 preferred)
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            if not writer.isOpened():
+                raise RuntimeError()
+        except Exception:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            if not writer.isOpened():
+                return None
+
+        half = int(max(1, seconds * fps / 2))
+        start = max(0, int(center_frame) - half)
+        end = min(total_frames - 1, int(center_frame) + half)
+
+        # frames_per_clip computed over full video, to align overlay mapping
+        frames_per_clip = max(1.0, total_frames / max(1, len(predictions)))
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        cur = start
+        while cur <= end:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            clip_idx = min(int(cur / frames_per_clip), max(0, len(predictions) - 1))
+            pred_class = predictions[clip_idx] if predictions else 0
+            confidence = confidences[clip_idx] if confidences else 0.0
+            text = f"{class_names[pred_class]}: {confidence:.2f}"
+            cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+            writer.write(frame)
+            cur += 1
+
+        cap.release()
+        writer.release()
+        return output_path
+    except Exception:
+        return None

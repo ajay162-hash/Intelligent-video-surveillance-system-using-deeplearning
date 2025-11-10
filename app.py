@@ -59,7 +59,7 @@ MODEL_AVAILABLE = MAXACCURACY_MODEL_AVAILABLE or C3D_AVAILABLE
 
 # Import utils directly from local directory
 sys.path.insert(0, os.path.join(current_dir, 'utils'))
-from video_utils import save_prediction_visualization, export_anomaly_clip
+from video_utils import save_prediction_visualization, export_anomaly_clip, save_prediction_visualization_segment
 
 # Now import inference
 sys.path.insert(0, current_dir)
@@ -201,6 +201,82 @@ def predict_video(model, video_path, clip_len=16, device='cuda'):
         return most_common_pred, avg_confidence, predictions, confidences
     else:
         return None, 0, [], []
+
+# Local high-resolution refinement around an approximate center using re-inference
+# Searches a short window with denser sampling and tighter stride to lock to the
+# peak probability for the target class. Keeps all other app behavior intact.
+
+def refine_center_with_model(model, video_path: str, approx_center_frame: int, target_class: int,
+                             device, clip_len: int = 16, window_seconds: float = 2.0,
+                             step_frames: int = 4) -> int:
+    try:
+        import cv2
+        import numpy as np
+        from torchvision import transforms
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return approx_center_frame
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 1e-3:
+            fps = 25.0
+        half = int(max(8, fps * window_seconds / 2))
+        start = max(0, int(approx_center_frame) - half)
+        end = min(total - 1, int(approx_center_frame) + half)
+        # Read frames sequentially in the window
+        frames = []
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        cur = start
+        while cur <= end:
+            ok, f = cap.read()
+            if not ok:
+                break
+            frames.append(f)
+            cur += 1
+        cap.release()
+        if len(frames) < clip_len:
+            return approx_center_frame
+        # Build dense clips with stride step_frames
+        clips = []
+        starts = []
+        for i in range(0, len(frames) - clip_len + 1, step_frames):
+            clips.append(frames[i:i+clip_len])
+            starts.append(i)
+        if not clips:
+            return approx_center_frame
+        transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((112, 112)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        proc = []
+        for clip in clips:
+            frs = []
+            for fr in clip:
+                fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+                fr = transform(fr)
+                frs.append(fr)
+            clip_tensor = torch.stack(frs).permute(1,0,2,3).unsqueeze(0)
+            proc.append(clip_tensor)
+        model.eval()
+        probs_all = []
+        with torch.no_grad():
+            bs = 8 if device.type == 'cuda' else 4
+            for i in range(0, len(proc), bs):
+                batch = torch.cat(proc[i:i+bs], dim=0).to(device)
+                out = model(batch)
+                probs = torch.nn.functional.softmax(out, dim=1)
+                probs_all.append(probs[:, target_class].detach().cpu().numpy())
+        import numpy as np
+        p = np.concatenate(probs_all, axis=0)
+        idx = int(np.argmax(p))
+        # Map selected local clip to absolute center frame
+        local_center = starts[idx] + clip_len//2
+        refined_center = start + local_center
+        return int(refined_center)
+    except Exception:
+        return approx_center_frame
 
 # Model loading function
 def load_model(model_path, num_classes=14, device='cuda'):
@@ -483,7 +559,7 @@ app = Flask(__name__,
 app.config['SECRET_KEY'] = 'ucf_crime_detection_app'
 app.config['UPLOAD_FOLDER'] = os.path.join(static_dir, 'uploads')
 app.config['OUTPUT_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output')
-app.config['MODEL_PATH'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trained_models', 'best_model.pth')
+app.config['MODEL_PATH'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trained_models_v2', 'best_model.pth')
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max upload size
 
 # Twilio configuration - made optional
@@ -1240,31 +1316,12 @@ def process_video(filename):
                 with open(filepath, 'rb') as src_file, open(original_event_path, 'wb') as dst_file:
                     dst_file.write(src_file.read())
             
-            # Create visualization and save with event-based name (OPTIMIZED: skip if video too long)
+            # Prepare visualization paths; generation happens after we locate exact center
             vis_filepath_web = os.path.join(app.config['UPLOAD_FOLDER'], event_result_filename)
             vis_filepath_output = os.path.join(app.config['OUTPUT_FOLDER'], event_result_filename)
-            
-            # Skip visualization for very long videos to speed up (optional optimization)
             video = cv2.VideoCapture(filepath)
             video_frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT)) if video.isOpened() else 0
             video.release()
-            
-            vis_path = None
-            if video_frame_count < 5000:  # Only create visualization for videos < 5000 frames (~3min at 30fps)
-                os.makedirs(os.path.dirname(vis_filepath_output), exist_ok=True)
-                vis_path = save_prediction_visualization(
-                    filepath, all_preds, all_confs, CLASS_NAMES,
-                    output_path=vis_filepath_web
-                )
-                # Also save a copy to the output folder
-                actual_vis_web = vis_path if vis_path else vis_filepath_web
-                if os.path.exists(actual_vis_web):
-                    with open(actual_vis_web, 'rb') as src_file, open(vis_filepath_output, 'wb') as dst_file:
-                        dst_file.write(src_file.read())
-            else:
-                # For long videos, create a placeholder or skip visualization
-                vis_path = vis_filepath_web  # Use placeholder path
-                print(f"[Optimization] Skipping visualization for long video ({video_frame_count} frames)")
             
             # Prepare Gemini alert text and anomaly snapshots
             # Determine best clip index for snapshots
@@ -1289,22 +1346,144 @@ def process_video(filename):
                     clip_len=16, sample_rate=10, overlap=0.5, count=2
                 )
 
-            # Try to export a short anomaly clip (3s) for WhatsApp media
+            # Try to export a short anomaly clip (4s) for WhatsApp media
             clip_file = ''
             try:
-                # Map best_clip_idx to approximate center frame index in original video
-                step = max(1, int(16 * (1 - 0.5)))  # consistent with predict_video
-                sampled_center = (best_clip_idx if best_clip_idx is not None else 0) * step + 8
-                center_frame = sampled_center * 10  # sample_rate=10 in predict_video
+                # Recompute the sampling and clipping parameters exactly as used in predict_video
+                cap2 = cv2.VideoCapture(filepath)
+                total_frames = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT)) if cap2.isOpened() else 0
+                fps_read = cap2.get(cv2.CAP_PROP_FPS) if cap2.isOpened() else 0
+                cap2.release()
+                # Adaptive sample_rate must mirror predict_video
+                if total_frames > 1000:
+                    sample_rate = max(15, int(total_frames / 80))
+                else:
+                    sample_rate = 10
+                clip_len = 16
+                overlap = 0.5
+                step_size = max(1, int(clip_len * (1 - overlap)))
+                # Number of sampled frames
+                n_frames_sampled = ((total_frames - 1) // sample_rate + 1) if total_frames > 0 else 0
+                # Number of clips before any decimation
+                if n_frames_sampled <= 0:
+                    original_clip_idx = 0
+                else:
+                    if n_frames_sampled <= clip_len:
+                        n_clips = 1
+                    else:
+                        n_clips = ((n_frames_sampled - clip_len) // step_size) + 1
+                    # Decimation factor used when limiting to max_clips in predict_video
+                    max_clips = 50
+                    decim = (n_clips // max_clips) if n_clips > max_clips else 1
+                    # Map best_clip_idx (post-decimation) back to original clip index
+                    original_clip_idx = ((best_clip_idx or 0) * decim)
+                # Compute center in sampled-frame space, then convert to original frame index
+                sampled_center = original_clip_idx * step_size + (clip_len // 2)
+                approx_center_frame = sampled_center * sample_rate
+                # Clamp to valid range
+                if total_frames > 0:
+                    approx_center_frame = max(0, min(approx_center_frame, total_frames - 1))
+                # Refine center by finding peak motion (impact) near the approx center
+                try:
+                    fps_val = fps_read if fps_read and fps_read > 1e-3 else 25.0
+                    # Search a tight window around the approx center
+                    search_radius = int(max(8, fps_val * 1.5))  # ±1.5s window improves robustness
+                    start_scan = max(0, approx_center_frame - search_radius)
+                    end_scan = min(total_frames - 1, approx_center_frame + search_radius)
+                    cap_scan = cv2.VideoCapture(filepath)
+                    cap_scan.set(cv2.CAP_PROP_POS_FRAMES, start_scan)
+                    prev_gray = None
+                    prev_diff_score = None
+                    best_score = -1.0
+                    best_frame_idx = approx_center_frame
+                    cur_idx = start_scan
+                    while cur_idx <= end_scan:
+                        ok, frame = cap_scan.read()
+                        if not ok:
+                            break
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        # Light blur to reduce noise
+                        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+                        if prev_gray is not None:
+                            # Base motion: mean absolute difference
+                            diff = cv2.absdiff(gray, prev_gray)
+                            diff_score = float(cv2.mean(diff)[0])
+                            # Edge change (crash edges change abruptly)
+                            try:
+                                edge_cur = cv2.Laplacian(gray, cv2.CV_16S)
+                                edge_prev = cv2.Laplacian(prev_gray, cv2.CV_16S)
+                                edge_cur = cv2.convertScaleAbs(edge_cur)
+                                edge_prev = cv2.convertScaleAbs(edge_prev)
+                                edge_diff = float(cv2.mean(cv2.absdiff(edge_cur, edge_prev))[0])
+                            except Exception:
+                                edge_diff = 0.0
+                            # Suddenness (jerk): change in motion between consecutive frames
+                            jerk = abs(diff_score - (prev_diff_score if prev_diff_score is not None else diff_score))
+                            # Combined score prioritizing sudden, high-magnitude, edge-heavy changes
+                            score = diff_score + 0.4 * edge_diff + 0.75 * jerk
+                            if score > best_score:
+                                best_score = score
+                                best_frame_idx = cur_idx
+                            prev_diff_score = diff_score
+                        prev_gray = gray
+                        cur_idx += 1
+                    cap_scan.release()
+                    center_frame = int(best_frame_idx)
+                except Exception:
+                    center_frame = int(approx_center_frame)
+                # Second-stage refinement: run a dense, local re-inference around the impact
+                try:
+                    center_frame = refine_center_with_model(
+                        model, filepath, center_frame, pred_class, device,
+                        clip_len=16, window_seconds=2.0, step_frames=4
+                    )
+                except Exception:
+                    pass
                 clip_file = export_anomaly_clip(
                     filepath,
                     center_frame=center_frame,
-                    seconds=3.0,
+                    seconds=4.0,
                     out_dir=app.config['UPLOAD_FOLDER'],
                     prefix=f"clip_{event_name.lower()}_"
                 )
             except Exception:
                 clip_file = ''
+
+            # Create visualization now (always produce a playable file)
+            try:
+                os.makedirs(os.path.dirname(vis_filepath_output), exist_ok=True)
+                if video_frame_count < 5000:
+                    vis_path = save_prediction_visualization(
+                        filepath, all_preds, all_confs, CLASS_NAMES,
+                        output_path=vis_filepath_web
+                    )
+                else:
+                    # Lightweight segment visualization around detected center
+                    vis_path = save_prediction_visualization_segment(
+                        filepath, all_preds, all_confs, CLASS_NAMES,
+                        center_frame=center_frame, seconds=6.0,
+                        output_path=vis_filepath_web
+                    )
+                actual_vis_web = vis_path if vis_path else None
+                if actual_vis_web and os.path.exists(actual_vis_web):
+                    with open(actual_vis_web, 'rb') as src_file, open(vis_filepath_output, 'wb') as dst_file:
+                        dst_file.write(src_file.read())
+                else:
+                    print("[Visualization] WARNING: Failed to create visualization; falling back to original copy")
+                    # Fallback: copy original video so player isn't empty
+                    with open(filepath, 'rb') as src_file, open(vis_filepath_web, 'wb') as dst_file:
+                        dst_file.write(src_file.read())
+                    with open(filepath, 'rb') as src_file, open(vis_filepath_output, 'wb') as dst_file:
+                        dst_file.write(src_file.read())
+            except Exception as _e:
+                print(f"[Visualization] ERROR: {_e}; using original video as placeholder")
+                try:
+                    with open(filepath, 'rb') as src_file, open(vis_filepath_web, 'wb') as dst_file:
+                        dst_file.write(src_file.read())
+                    with open(filepath, 'rb') as src_file, open(vis_filepath_output, 'wb') as dst_file:
+                        dst_file.write(src_file.read())
+                except Exception:
+                    pass
 
             # Generate dynamic alert text (Gemini if available)
             alert_text, alert_source = generate_gemini_alert_text(

@@ -1,23 +1,23 @@
-# Core dependencies for Intelligent Video Surveillance System
-torch>=1.9.0
-torchvision>=0.10.0
-opencv-python>=4.5.0
-numpy>=1.21.0
-tqdm>=4.62.0
-scikit-learn>=1.0.0
-matplotlib>=3.4.0
-seaborn>=0.11.0
+# Pinned dependencies for this application (versions reflect the current working setup)
 
-# Web framework
-Flask>=2.0.0
-Werkzeug>=2.0.0
+# Core
+torch==2.5.1
+torchvision==0.20.1
+opencv-python==4.12.0.88
+numpy==1.26.4
+tqdm==4.67.1
+scikit-learn==1.3.2
+Pillow==11.3.0
 
-# WhatsApp/SMS alerts
-twilio>=7.0.0
+# Web
+Flask==3.1.2
+Werkzeug==3.1.3
+requests==2.32.5
+python-dotenv==1.2.1
 
-# Optional: For enhanced training
-tensorboard>=2.7.0
-albumentations>=1.1.0
+# Alerts and AI
+twilio==9.8.5
+google-generativeai==0.8.5
 
-# Development tools
-Pillow>=8.3.0
+# Storage (optional but recommended for public media URLs)
+supabase==2.23.2
